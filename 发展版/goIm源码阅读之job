@@ -1,0 +1,245 @@
+### goIm组件之job
+这是最后一个组件了，但这个组件是很有用的。是不是呢
+是的啊
+
+首先还是老规矩
+看组件job的main函数
+做了什么呢，前面这几个肯定都是
+一样的了。一个全局配置
+
+type Config struct {
+	Log        string   `goconf:"base:log"`
+	ZKAddrs    []string `goconf:"kafka:zookeeper.list:,"`
+	ZKRoot     string   `goconf:"kafka:zkroot"`
+	KafkaTopic string   `goconf:"kafka:topic"`
+	// comet
+	Comets      map[int32]string `goconf:"-"`
+	RoutineSize int64            `goconf:"comet:routine.size"`
+	RoutineChan int              `goconf:"comet:routine.chan"`
+	// push
+	PushChan     int `goconf:"push:chan"`
+	PushChanSize int `goconf:"push:chan.size"`
+	// timer
+	Timer     int `goconf:"timer:num"`
+	TimerSize int `goconf:"timer:size"`
+	// room
+	RoomBatch  int           `goconf:"room:batch"`
+	RoomSignal time.Duration `goconf:"room:signal:time"`
+	// monitor
+	MonitorOpen  bool     `goconf:"monitor:open"`
+	MonitorAddrs []string `goconf:"monitor:addrs:,"`
+}
+
+
+全局组件
+log 日志
+ZKAddrs zk地址
+ZKRoot zk入境
+KafkaTopic 主题
+
+Comets comet组件映射
+RoutineSize 携程数量
+RoutineChan 数量
+
+PushChan 推送通道
+PushChanSize推送大小
+
+Timer 定时器
+TimerSize 大小
+
+RoomBatch 房间批量
+RoomSignal 房间过期时间
+
+MonitorOpen 是否监控
+MonitorAddrs 监控地址
+
+
+然后初始化Comet组件
+
+func InitComet(addrs map[int32]string, options CometOptions) (err error) {
+	var (
+		serverId      int32
+		bind          string
+		network, addr string
+	)
+	for serverId, bind = range addrs {
+		var rpcOptions []xrpc.ClientOptions
+		for _, bind = range strings.Split(bind, ",") {
+			if network, addr, err = inet.ParseNetwork(bind); err != nil {
+				log.Error("inet.ParseNetwork() error(%v)", err)
+				return
+			}
+			options := xrpc.ClientOptions{
+				Proto: network,
+				Addr:  addr,
+			}
+			rpcOptions = append(rpcOptions, options)
+		}
+		// rpc clients
+		rpcClient := xrpc.Dials(rpcOptions)
+		// ping & reconnect
+		rpcClient.Ping(CometServicePing)
+		// comet
+		c := new(Comet)
+		c.serverId = serverId
+		c.rpcClient = rpcClient
+		c.pushRoutines = make([]chan *proto.MPushMsgArg, options.RoutineSize)
+		c.roomRoutines = make([]chan *proto.BoardcastRoomArg, options.RoutineSize)
+		c.broadcastRoutines = make([]chan *proto.BoardcastArg, options.RoutineSize)
+		c.options = options
+		cometServiceMap[serverId] = c
+		// process
+		for i := int64(0); i < options.RoutineSize; i++ {
+			pushChan := make(chan *proto.MPushMsgArg, options.RoutineChan)
+			roomChan := make(chan *proto.BoardcastRoomArg, options.RoutineChan)
+			broadcastChan := make(chan *proto.BoardcastArg, options.RoutineChan)
+			c.pushRoutines[i] = pushChan
+			c.roomRoutines[i] = roomChan
+			c.broadcastRoutines[i] = broadcastChan
+			go c.process(pushChan, roomChan, broadcastChan)
+		}
+		log.Info("init comet rpc: %v", rpcOptions)
+	}
+	return
+}
+
+定义一些变量
+serverId commet的标示
+bind 地址
+network 网络类型
+addr 地址
+然后循环解析
+Dials下rpc
+然后ping下
+
+
+接下来创建一个Comet啊
+然后设置相应的信息
+然后cometServiceMap注册cometId，与comet的对象到内存中去
+然后进行处理。开相应的携程处理
+最终达到
+
+// process
+func (c *Comet) process(pushChan chan *proto.MPushMsgArg, roomChan chan *proto.BoardcastRoomArg, broadcastChan chan *proto.BoardcastArg) {
+	var (
+		pushArg      *proto.MPushMsgArg
+		roomArg      *proto.BoardcastRoomArg
+		broadcastArg *proto.BoardcastArg
+		reply        = &proto.NoReply{}
+		err          error
+	)
+	for {
+		select {
+		case pushArg = <-pushChan:
+			// push
+			err = c.rpcClient.Call(CometServiceMPushMsg, pushArg, reply)
+			if err != nil {
+				log.Error("rpcClient.Call(%s, %v, reply) serverId:%d error(%v)", CometServiceMPushMsg, pushArg, c.serverId, err)
+			}
+			pushArg = nil
+		case roomArg = <-roomChan:
+			// room
+			err = c.rpcClient.Call(CometServiceBroadcastRoom, roomArg, reply)
+			if err != nil {
+				log.Error("rpcClient.Call(%s, %v, reply) serverId:%d error(%v)", CometServiceBroadcastRoom, roomArg, c.serverId, err)
+			}
+			roomArg = nil
+		case broadcastArg = <-broadcastChan:
+			// broadcast
+			err = c.rpcClient.Call(CometServiceBroadcast, broadcastArg, reply)
+			if err != nil {
+				log.Error("rpcClient.Call(%s, %v, reply) serverId:%d error(%v)", CometServiceBroadcast, broadcastArg, c.serverId, err)
+			}
+			broadcastArg = nil
+		}
+	}
+}
+
+
+接下来开启监控
+
+然后初始化RoomBucket
+
+	//room
+InitRoomBucket(round,
+	RoomOptions{
+	BatchNum:   Conf.RoomBatch,
+	SignalTime: Conf.RoomSignal,
+	})
+
+	出事话一个room桶
+
+接着
+
+func MergeRoomServers() {
+	var (
+		c           *Comet
+		ok          bool
+		roomId      int32
+		serverId    int32
+		roomIds     map[int32]struct{}
+		servers     map[int32]struct{}
+		roomServers = make(map[int32]map[int32]struct{})
+	)
+	// all comet nodes
+	for serverId, c = range cometServiceMap {
+		if c.rpcClient != nil {
+			if roomIds = roomsComet(c.rpcClient); roomIds != nil {
+				// merge room's servers
+				for roomId, _ = range roomIds {
+					if servers, ok = roomServers[roomId]; !ok {
+						servers = make(map[int32]struct{})
+						roomServers[roomId] = servers
+					}
+					servers[serverId] = struct{}{}
+				}
+			}
+		}
+	}
+	RoomServersMap = roomServers
+}
+这个函数做了什么呢
+和之前的解析也是差不多cometServiceMap
+统计相应的信息
+然后保存在内存中啊
+
+然后开启一个内部异步统计信息
+
+然后初始化InitPush()处理推送
+最后初始化kafka
+
+func InitKafka() error {
+	log.Info("start topic:%s consumer", Conf.KafkaTopic)
+	log.Info("consumer group name:%s", KAFKA_GROUP_NAME)
+	sarama.Logger = llog.New(os.Stdout, "[Sarama] ", llog.LstdFlags)
+	config := consumergroup.NewConfig()
+	config.Offsets.Initial = sarama.OffsetNewest
+	config.Offsets.ProcessingTimeout = OFFSETS_PROCESSING_TIMEOUT_SECONDS
+	config.Offsets.CommitInterval = OFFSETS_COMMIT_INTERVAL
+	config.Zookeeper.Chroot = Conf.ZKRoot
+	kafkaTopics := []string{Conf.KafkaTopic}
+	cg, err := consumergroup.JoinConsumerGroup(KAFKA_GROUP_NAME, kafkaTopics, Conf.ZKAddrs, config)
+	if err != nil {
+		return err
+	}
+	go func() {
+		for err := range cg.Errors() {
+			log.Error("consumer error(%v)", err)
+		}
+	}()
+	go func() {
+		for msg := range cg.Messages() {
+			log.Info("deal with topic:%s, partitionId:%d, Offset:%d, Key:%s msg:%s", msg.Topic, msg.Partition, msg.Offset, msg.Key, msg.Value)
+			push(msg.Value)
+			cg.CommitUpto(msg)
+		}
+	}()
+	return nil
+}
+
+完成操作
+
+
+
+
+

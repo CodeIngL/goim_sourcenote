@@ -1,0 +1,370 @@
+### goIm源码阅读之整体流程
+
+看完了所有goIm组件，我想还是有同学还不知道很多东西，
+我们现在重新来看一下整个流程
+
+
+假设系统现在要求一个推送。
+系统走的是http
+请求的的方式是对应于http.go该文件的。
+我们来看一下logic组件中的http.go
+关键函数:
+	func InitHTTP() (err error) {
+			。。。。。。
+			httpServeMux.HandleFunc("/1/push", Push)
+			httpServeMux.HandleFunc("/1/pushs", Pushs)
+			httpServeMux.HandleFunc("/1/push/all", PushAll)
+			httpServeMux.HandleFunc("/1/push/room", PushRoom)
+			httpServeMux.HandleFunc("/1/server/del", DelServer)
+			httpServeMux.HandleFunc("/1/count", Count)
+			。。。。。。
+	}
+对于logic组件的部署里面，对外开放了这6个api接口。我们选取其中的一个来走一遍。
+以Push为例:
+	func Push(w http.ResponseWriter, r *http.Request) {
+		if r.Method != "POST" {
+			http.Error(w, "Method Not Allowed", 405)
+			return
+		}
+		var (
+			body      string
+			serverId  int32
+			keys      []string
+			subKeys   map[int32][]string
+			bodyBytes []byte
+			userId    int64
+			err       error
+			uidStr    = r.URL.Query().Get("uid")
+			res       = map[string]interface{}{"ret": OK}
+		)
+		defer retPWrite(w, r, res, &body, time.Now())
+		if bodyBytes, err = ioutil.ReadAll(r.Body); err != nil {
+			log.Error("ioutil.ReadAll() failed (%s)", err)
+			res["ret"] = InternalErr
+			return
+		}
+		body = string(bodyBytes)
+		if userId, err = strconv.ParseInt(uidStr, 10, 64); err != nil {
+			log.Error("strconv.Atoi(\"%s\") error(%v)", uidStr, err)
+			res["ret"] = InternalErr
+			return
+		}
+		subKeys = genSubKey(userId)
+		for serverId, keys = range subKeys {
+			if err = mpushKafka(serverId, keys, bodyBytes); err != nil {
+				res["ret"] = InternalErr
+				return
+			}
+		}
+		res["ret"] = OK
+		return
+	}
+直接分析:
+	首先该请求一定是post请求,然后定义了一串变量,接着defer一个返回函数
+	然后读取请求的body部分，通过一个butey转化到string上去
+	接着获得URL中uid部分，
+	通过uid(userId)得到一个subkeys，这个key是这样来的
+看函数:
+	func genSubKey(userId int64) (res map[int32][]string) {
+		var (
+			err    error
+			i      int
+			ok     bool
+			key    string
+			keys   []string
+			args   = proto.GetArg{UserId: userId}
+			reply  = proto.GetReply{}
+			client *xrpc.Clients
+		)
+		res = make(map[int32][]string)
+		if client, err = getRouterByUID(userId); err != nil {
+			return
+		}
+		if err = client.Call(routerServiceGet, &args, &reply); err != nil {
+			log.Error("client.Call(\"%s\",\"%v\") error(%v)", routerServiceGet, args, err)
+			return
+		}
+		for i = 0; i < len(reply.Servers); i++ {
+			key = encode(userId, reply.Seqs[i])
+			if keys, ok = res[reply.Servers[i]]; !ok {
+				keys = []string{}
+			}
+			keys = append(keys, key)
+			res[reply.Servers[i]] = keys
+		}
+		return
+	}
+	创建一个map，然后通过userId得到相应的rpcClient
+	然后远程调用router组件的rpcGet的接口。获得了seq和comet组件的标示
+	然后遍历相应的comet组件，处理userId和seq 形成key(userID_SEQ)
+	如果res[cometId]不存在，将key追加到keys中，然后将keys作为res[commetId]的value
+这个res就是返回的subKeys
+
+截止就是遍历这个subkey 获得相硬的comet组件，以及对应的userId
+调用 mpushKafka(serverId, keys, bodyBytes) 写到kafka中，这里干了什么呢
+
+
+func mpushKafka(serverId int32, keys []string, msg []byte) (err error) {
+	var (
+		vBytes []byte
+		v      = &proto.KafkaMsg{OP: define.KAFKA_MESSAGE_MULTI, ServerId: serverId, SubKeys: keys, Msg: msg}
+	)
+	if vBytes, err = json.Marshal(v); err != nil {
+		return
+	}
+	producer.Input() <- &sarama.ProducerMessage{Topic: KafkaPushsTopic, Value: sarama.ByteEncoder(vBytes)}
+	return
+}
+
+初始化一kafakMsg：操作是MULTI，serverId对应的comet组件，SubKeys对应的key(userID_SEQ),Msg 系统请求logic的body
+然后json化一下。
+封装成一个生产消息写入producer.input()的这个channel里面中
+
+然后携程handleSucess回调记录日志
+
+
+res写入ok键值对
+
+push接口返回调用方相关信息
+
+这样只完成了消息的写入，还没推送给客户端。。。
+
+是这样的，推送工作是由相应的job负责。我们现在来看一下，job的流程
+进入job组件的kafka.go里面去
+	go func() {
+		for msg := range cg.Messages() {
+			log.Info("deal with topic:%s, partitionId:%d, Offset:%d, Key:%s msg:%s", msg.Topic, msg.Partition, msg.Offset, msg.Key, msg.Value)
+			push(msg.Value)
+			cg.CommitUpto(msg)
+		}
+	}()
+可以看到这边在收取kafka的信息，然后调用了push
+func push(msg []byte) (err error) {
+	m := &proto.KafkaMsg{}
+	if err = json.Unmarshal(msg, m); err != nil {
+		log.Error("json.Unmarshal(%s) error(%s)", msg, err)
+		return
+	}
+	switch m.OP {
+	case define.KAFKA_MESSAGE_MULTI:
+		pushChs[rand.Int()%Conf.PushChan] <- &pushArg{ServerId: m.ServerId, SubKeys: m.SubKeys, Msg: m.Msg, RoomId: define.NoRoom}
+	case define.KAFKA_MESSAGE_BROADCAST:
+		broadcast(m.Msg)
+	case define.KAFKA_MESSAGE_BROADCAST_ROOM:
+		room := roomBucket.Get(int32(m.RoomId))
+		if m.Ensure {
+			go room.EPush(0, define.OP_SEND_SMS_REPLY, m.Msg)
+		} else {
+			err = room.Push(0, define.OP_SEND_SMS_REPLY, m.Msg)
+			if err != nil {
+				log.Error("room.Push(%s) roomId:%d error(%v)", m.Msg, err)
+			}
+		}
+	default:
+		log.Error("unknown operation:%s", m.OP)
+	}
+	return
+}
+进入一看，首先，将消息从json格式反射到&proto.KafkaMsg{}
+然后进入相应的选择，这里我们选择的是push
+对应的就是
+	define.KAFKA_MESSAGE_MULTI
+	这个做了什么呢，
+	pushChs[rand.Int()%Conf.PushChan] <- &pushArg{ServerId: m.ServerId, SubKeys: m.SubKeys, Msg: m.Msg, RoomId: define.NoRoom}
+	写入了channel里边，然后携程
+	// push routine
+	func processPush(ch chan *pushArg) {
+		var arg *pushArg
+		for {
+			arg = <-ch
+			mPushComet(arg.ServerId, arg.SubKeys, arg.Msg)
+		}
+	}
+	这个进行读取，调用了mPushComet(....)
+
+	// mPushComet push a message to a batch of subkeys
+	func mPushComet(serverId int32, subKeys []string, body json.RawMessage) {
+		var args = proto.MPushMsgArg{
+			Keys: subKeys, P: proto.Proto{Ver: 0, Operation: define.OP_SEND_SMS_REPLY, Body: body},
+		}
+		if c, ok := cometServiceMap[serverId]; ok {
+			if err := c.Push(&args); err != nil {
+				log.Error("c.Push(%v) serverId:%d error(%v)", args, serverId, err)
+			}
+		}
+	}
+	这个毛剑大神在上面写了注释，批量的推送信息
+	看到关键Push
+	进入之后
+		// user push
+	func (c *Comet) Push(arg *proto.MPushMsgArg) (err error) {
+		num := atomic.AddInt64(&c.pushRoutinesNum, 1) % c.options.RoutineSize
+		c.pushRoutines[num] <- arg
+		return
+	}
+	又是写入了channel，然后继续看哪里写出
+
+	看到这个InitComet方法中有这个细节我们观察下	
+	// process
+		for i := int64(0); i < options.RoutineSize; i++ {
+			pushChan := make(chan *proto.MPushMsgArg, options.RoutineChan)
+			roomChan := make(chan *proto.BoardcastRoomArg, options.RoutineChan)
+			broadcastChan := make(chan *proto.BoardcastArg, options.RoutineChan)
+			c.pushRoutines[i] = pushChan
+			c.roomRoutines[i] = roomChan
+			c.broadcastRoutines[i] = broadcastChan
+			go c.process(pushChan, roomChan, broadcastChan)
+		}
+	开了携程，我们看下这些携程咋干嘛
+
+	// process
+func (c *Comet) process(pushChan chan *proto.MPushMsgArg, roomChan chan *proto.BoardcastRoomArg, broadcastChan chan *proto.BoardcastArg) {
+	var (
+		pushArg      *proto.MPushMsgArg
+		roomArg      *proto.BoardcastRoomArg
+		broadcastArg *proto.BoardcastArg
+		reply        = &proto.NoReply{}
+		err          error
+	)
+	for {
+		select {
+		case pushArg = <-pushChan:
+			// push
+			err = c.rpcClient.Call(CometServiceMPushMsg, pushArg, reply)
+			if err != nil {
+				log.Error("rpcClient.Call(%s, %v, reply) serverId:%d error(%v)", CometServiceMPushMsg, pushArg, c.serverId, err)
+			}
+			pushArg = nil
+		case roomArg = <-roomChan:
+			// room
+			err = c.rpcClient.Call(CometServiceBroadcastRoom, roomArg, reply)
+			if err != nil {
+				log.Error("rpcClient.Call(%s, %v, reply) serverId:%d error(%v)", CometServiceBroadcastRoom, roomArg, c.serverId, err)
+			}
+			roomArg = nil
+		case broadcastArg = <-broadcastChan:
+			// broadcast
+			err = c.rpcClient.Call(CometServiceBroadcast, broadcastArg, reply)
+			if err != nil {
+				log.Error("rpcClient.Call(%s, %v, reply) serverId:%d error(%v)", CometServiceBroadcast, broadcastArg, c.serverId, err)
+			}
+			broadcastArg = nil
+		}
+	}
+}
+
+这里才是看到的正主，还是只根据我们的push来看，这里的pushchan就是我们要用的，每一次从channel中读取之后，马上调用远程的rpc
+调用直接转到comet组件的
+// Push push a message to a specified sub key
+func (this *PushRPC) MPushMsg(arg *proto.MPushMsgArg, reply *proto.MPushMsgReply) (err error) {
+	var (
+		bucket  *Bucket
+		channel *Channel
+		key     string
+		n       int
+	)
+	reply.Index = -1
+	if arg == nil {
+		err = ErrMPushMsgArg
+		return
+	}
+	for n, key = range arg.Keys {
+		bucket = DefaultServer.Bucket(key)
+		if channel = bucket.Channel(key); channel != nil {
+			if err = channel.Push(&arg.P); err != nil {
+				return
+			}
+			reply.Index = int32(n)
+		}
+	}
+	return
+}
+上面也写了很多的注释，我们继续看一下，根据key找到相应的桶。找到桶里相应的channel包装对象
+然进行推送
+// Push server push message.
+func (c *Channel) Push(p *proto.Proto) (err error) {
+	select {
+	case c.signal <- p:
+	default:
+	}
+	return
+}
+写入到c.signal中，我们再看一下哪里被取出，
+
+// Ready check the channel ready or close?
+func (c *Channel) Ready() *proto.Proto {
+	return <-c.signal
+}
+
+在这里被取出，哪里调用的呢，继续看
+
+func (server *Server) dispatchWebsocket(key string, conn *websocket.Conn, ch *Channel) {
+	var (
+		p   *proto.Proto
+		err error
+	)
+	if Debug {
+		log.Debug("key: %s start dispatch websocket goroutine", key)
+	}
+	for {
+		p = ch.Ready()
+		switch p {
+		case proto.ProtoFinish:
+			if Debug {
+				log.Debug("key: %s wakeup exit dispatch goroutine", key)
+			}
+			goto failed
+		case proto.ProtoReady:
+			for {
+				if p, err = ch.CliProto.Get(); err != nil {
+					err = nil // must be empty error
+					break
+				}
+				if err = p.WriteWebsocket(conn); err != nil {
+					goto failed
+				}
+				p.Body = nil // avoid memory leak
+				ch.CliProto.GetAdv()
+			}
+		default:
+			// TODO room-push support
+			// just forward the message
+			if err = p.WriteWebsocket(conn); err != nil {
+				goto failed
+			}
+		}
+	}
+failed:
+	if err != nil {
+		log.Error("key: %s dispatch websocket error(%v)", key, err)
+	}
+	conn.Close()
+	// must ensure all channel message discard, for reader won't blocking Signal
+	for {
+		if p == proto.ProtoFinish {
+			break
+		}
+		p = ch.Ready()
+	}
+	if Debug {
+		log.Debug("key: %s dispatch goroutine exit", key)
+	}
+	return
+}
+
+这个函数在websocket.go中分发了所有的的处理作为携程，关注上面的
+	case proto.ProtoReady:
+			for {
+				if p, err = ch.CliProto.Get(); err != nil {
+					err = nil // must be empty error
+					break
+				}
+				if err = p.WriteWebsocket(conn); err != nil {
+					goto failed
+				}
+				p.Body = nil // avoid memory leak
+				ch.CliProto.GetAdv()
+			}
+	这样就写回了websocket的链接，写会给客户端，也就是完成了整个的推送。
+
+

@@ -1,0 +1,144 @@
+### goIm组件之logic
+首先看main函数，
+和我们之前的router的结构是一模一样额。
+先初始化配置对象，
+然后使用goConf去设置相应的配置。
+开启核心数，
+开启日志
+然后开启监控
+开启http监控
+注册到router的RPC上上去
+
+comet分析完成后
+回过头来重新看logic
+
+走完router的RPC上去后
+
+执行了MergeCount 这是干什么呢
+在这之前，先来仔细看一下
+
+func InitRouter(addrs map[string]string) (err error) {
+	var (
+		network, addr string
+	)
+	routerRing = ketama.NewRing(ketama.Base)
+	for serverId, bind := range addrs {
+		var rpcOptions []xrpc.ClientOptions
+		for _, bind = range strings.Split(bind, ",") {
+			if network, addr, err = inet.ParseNetwork(bind); err != nil {
+				log.Error("inet.ParseNetwork() error(%v)", err)
+				return
+			}
+			options := xrpc.ClientOptions{
+				Proto: network,
+				Addr:  addr,
+			}
+			rpcOptions = append(rpcOptions, options)
+		}
+		// rpc clients
+		rpcClient := xrpc.Dials(rpcOptions)
+		// ping & reconnect
+		rpcClient.Ping(routerServicePing)
+		routerRing.AddNode(serverId, 1)
+		routerServiceMap[serverId] = rpcClient
+		log.Info("router rpc connect: %v ", rpcOptions)
+	}
+	routerRing.Bake()
+	return
+}
+
+
+定义网络和地址变量
+使用ketama一致性算法，生成一个routerRing
+然后遍历地址，处理整个逻辑 组装成rpcOption
+让去dial组成clients，然后ping下router
+然后经serverId注册到routerRing中，然后在routerServicerMap中注册相依的关系
+接着router组件完成
+
+回到logic的main.go中接下来开启monitor
+
+执行一个mergeCount，
+这个是干什么呢
+
+
+func MergeCount() {
+	var (
+		c                     *xrpc.Clients
+		err                   error
+		roomId, server, count int32
+		counter               map[int32]int32
+		roomCount             = make(map[int32]int32)
+		serverCount           = make(map[int32]int32)
+	)
+	// all comet nodes
+	for _, c = range routerServiceMap {
+		if c != nil {
+			if counter, err = allRoomCount(c); err != nil {
+				continue
+			}
+			for roomId, count = range counter {
+				roomCount[roomId] += count
+			}
+			if counter, err = allServerCount(c); err != nil {
+				continue
+			}
+			for server, count = range counter {
+				serverCount[server] += count
+			}
+		}
+	}
+	RoomCountMap = roomCount
+	ServerCountMap = serverCount
+}
+
+代码不长，慢慢来看
+
+定义一群变量
+ 然后遍历routerServiceMap这个东西 这个多次提到了 存的是commet的router的节点和相应的rpcclient
+ 做了什么呢首先，计算所有房间数量，对每一个的router来说
+ 
+ 这个函数也是调用远程的rpc接口，统计数量 然后 这个数量还带有房间人数呢
+ 然后，
+ 遍历继续统计
+ 接着调用allServerCount()获得了每个节点的数量
+ 然后，
+ 遍历继续统计
+ 将这辆数量设置好子给RoomCountMap和ServerCountMap上
+ 然后执行携程，syncCount，每秒异步统计
+ 感觉这频率有点高啊，不过没事携程几十万个这个执行也得好久呢
+
+ 接下来干了的事情
+ 就是初始化紫的rpc接口了
+ if err := InitRPC(NewDefaultAuther()); err != nil {
+		panic(err)
+	}
+    做了什么呢 继续看呗
+    首先newDefault，这当然非常的清楚了，现在这个是demo。所以毛大给我们的是一个简单老的离职
+    这个默认的认证实在太简单了
+
+看主体函数
+
+func InitRPC(auther Auther) (err error) {
+	var (
+		network, addr string
+		c             = &RPC{auther: auther}
+	)
+	rpc.Register(c)
+	for i := 0; i < len(Conf.RPCAddrs); i++ {
+		log.Info("start listen rpc addr: \"%s\"", Conf.RPCAddrs[i])
+		if network, addr, err = inet.ParseNetwork(Conf.RPCAddrs[i]); err != nil {
+			log.Error("inet.ParseNetwork() error(%v)", err)
+			return
+		}
+		go rpcListen(network, addr)
+	}
+	return
+}
+
+至此logic的逻辑也全部完成了
+
+
+
+
+
+
